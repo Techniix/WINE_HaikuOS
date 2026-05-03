@@ -75,6 +75,20 @@
 extern void _thread_set_tsd_base(uint64_t);
 #endif
 
+#ifdef __HAIKU__
+# include <SupportDefs.h>
+#if 0
+# include <private/system/syscalls.h>
+# include <private/system/arch/x86/arch_thread_defs.h>
+#else
+#define THREAD_SYSCALLS			"thread"
+#define THREAD_SET_GS_BASE		1
+
+extern status_t		_kern_generic_syscall(const char *subsystem, uint32 function,
+                                              void *buffer, size_t bufferSize);
+#endif
+#endif
+
 #include "ntstatus.h"
 #include "windef.h"
 #include "winternl.h"
@@ -322,6 +336,35 @@ static inline const WORD *SS_sig_ptr( const ucontext_t *context )
 }
 #define SS_sig(context) (*SS_sig_ptr(context))
 
+#define XState_sig(context)  NULL
+
+#elif defined (__HAIKU__)
+
+#define RAX_sig(context)     ((context)->uc_mcontext.rax)
+#define RBX_sig(context)     ((context)->uc_mcontext.rbx)
+#define RCX_sig(context)     ((context)->uc_mcontext.rcx)
+#define RDX_sig(context)     ((context)->uc_mcontext.rdx)
+#define RSI_sig(context)     ((context)->uc_mcontext.rsi)
+#define RDI_sig(context)     ((context)->uc_mcontext.rdi)
+#define RBP_sig(context)     ((context)->uc_mcontext.rbp)
+#define R8_sig(context)      ((context)->uc_mcontext.r8)
+#define R9_sig(context)      ((context)->uc_mcontext.r9)
+#define R10_sig(context)     ((context)->uc_mcontext.r10)
+#define R11_sig(context)     ((context)->uc_mcontext.r11)
+#define R12_sig(context)     ((context)->uc_mcontext.r12)
+#define R13_sig(context)     ((context)->uc_mcontext.r13)
+#define R14_sig(context)     ((context)->uc_mcontext.r14)
+#define R15_sig(context)     ((context)->uc_mcontext.r15)
+#define CS_sig(context)      cs64_sel
+#define FS_sig(context)      NULL
+#define GS_sig(context)      NULL
+#define SS_sig(context)      NULL
+#define EFL_sig(context)     ((context)->uc_mcontext.rflags)
+#define RIP_sig(context)     ((context)->uc_mcontext.rip)
+#define RSP_sig(context)     ((context)->uc_mcontext.rsp)
+#define TRAP_sig(context)    TRAP_x86_PAGEFLT
+#define ERROR_sig(context)   0
+#define FPU_sig(context)     ((XMM_SAVE_AREA32 *)&(context)->uc_mcontext.fpu)
 #define XState_sig(context)  NULL
 
 #else
@@ -715,9 +758,11 @@ static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontex
     R14_sig(sigcontext) = context->R14;
     R15_sig(sigcontext) = context->R15;
     RIP_sig(sigcontext) = context->Rip;
+#ifndef __HAIKU__
     CS_sig(sigcontext)  = context->SegCs;
     FS_sig(sigcontext)  = context->SegFs;
     EFL_sig(sigcontext) = context->EFlags;
+#endif
 }
 
 
@@ -830,9 +875,11 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
     context->R14    = R14_sig(sigcontext);
     context->R15    = R15_sig(sigcontext);
     context->Rip    = RIP_sig(sigcontext);
+#ifndef __HAIKU__
     context->SegCs  = CS_sig(sigcontext);
     context->SegFs  = FS_sig(sigcontext);
     context->EFlags = EFL_sig(sigcontext);
+#endif
     context->SegDs  = ds64_sel;
     context->SegEs  = ds64_sel;
     context->SegGs  = ds64_sel;
@@ -1474,7 +1521,9 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
         context_init_xstate( &stack->context, NULL );
     }
 
+#ifndef __HAIKU__
     CS_sig(sigcontext)  = cs64_sel;
+#endif
     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
     RSP_sig(sigcontext) = (ULONG_PTR)stack;
     /* clear single-step, direction, and align check flag */
@@ -1874,6 +1923,7 @@ static inline BOOL handle_interrupt( struct thread_data *data, ucontext_t *sigco
     case 0x2c:
         rec->ExceptionCode = STATUS_ASSERTION_FAILURE;
         break;
+#ifndef __HAIKU__
     case 0x2d:
         if (CS_sig(sigcontext) == cs64_sel)
         {
@@ -1894,6 +1944,7 @@ static inline BOOL handle_interrupt( struct thread_data *data, ucontext_t *sigco
         rec->NumberParameters = 1;
         rec->ExceptionInformation[0] = context->Rax;
         break;
+#endif
     default:
         return FALSE;
     }
@@ -2229,6 +2280,45 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
     return TRUE;
 }
 
+NTSTATUS static LdrFindEntryForAddress2( const void *addr, PLDR_DATA_TABLE_ENTRY *pmod )
+{
+    PLIST_ENTRY mark, entry;
+    PLDR_DATA_TABLE_ENTRY mod;
+
+    mark = &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList;
+    for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+    {
+        mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+        if (mod->DllBase <= addr &&
+            (const char *)addr < (char*)mod->DllBase + mod->SizeOfImage)
+        {
+            *pmod = mod;
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_NO_MORE_ENTRIES;
+}
+
+static void WriteRtlString(UNICODE_STRING str)
+{
+	for (int i = 0; i < str.Length; i++) {
+		printf("%c", str.Buffer[i]);
+	}
+}
+
+static void WriteModuleName(addr_t address)
+{
+	HMODULE hModule = NULL;
+	PLDR_DATA_TABLE_ENTRY pmod = NULL;
+	LdrFindEntryForAddress2(
+		(void*)address,
+		&pmod
+	);
+	hModule = pmod == NULL ? NULL : pmod->DllBase;
+	printf("  hModule: %p\n", hModule);
+	if (hModule != NULL)
+	printf("  BaseDllName: %s\n", debugstr_w(pmod->BaseDllName.Buffer)); printf("\n");
+}
 
 /**********************************************************************
  *		segv_handler
@@ -2241,6 +2331,20 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     struct thread_data *data = init_handler( sigcontext );
     struct xcontext context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
+
+#ifdef __HAIKU__
+	printf("segv_handler\n");
+    printf("&segv_handler: %p\n", &segv_handler);
+    printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
+    printf("  thread: %" PRId32 "\n", find_thread(NULL));
+    printf("  IP: %#" PRIx64 "\n", RIP_sig(sigcontext));
+    printf("  SP: %#" PRIx64 "\n", RSP_sig(sigcontext));
+    printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
+    printf("  address: %#" PRIx64 "\n", siginfo->si_addr);
+    WriteModuleName(RIP_sig(sigcontext));
+    fgetc(stdin);
+    //_exit(1);
+#endif
 
     save_context( data, &context, sigcontext );
 
@@ -2472,6 +2576,20 @@ static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+
+#ifdef __HAIKU__
+    printf("abrt_handler\n");
+    printf("&abrt_handler: %p\n", &segv_handler);
+    printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
+    printf("  thread: %" PRId32 "\n", find_thread(NULL));
+    printf("  IP: %#" PRIx64 "\n", RIP_sig(sigcontext));
+    printf("  SP: %#" PRIx64 "\n", RSP_sig(sigcontext));
+    printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
+    printf("  address: %#" PRIx64 "\n", siginfo->si_addr);
+    //fgetc(stdin);
+    //_exit(1);
+#endif
+
     struct thread_data *data = init_handler( sigcontext );
     struct xcontext context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_WINE_ASSERTION,
@@ -2567,6 +2685,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         wait_suspend( &context.c );
         restore_context( data, &context, sigcontext );
     }
+//#endif
 }
 
 
@@ -2874,6 +2993,9 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
     sysarch( X86_64_SET_GSBASE, &teb );
 #elif defined (__APPLE__)
     thread_data->pthread_teb = mac_thread_gsbase();
+#elif defined (__HAIKU__)
+    //thread_data->pthread_teb = amd64_thread_data()->pthread_teb;
+    _kern_generic_syscall(THREAD_SYSCALLS, THREAD_SET_GS_BASE, &teb, sizeof(teb));
 #else
 # error Please define setting %gs for your architecture
 #endif

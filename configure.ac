@@ -1472,7 +1472,7 @@ WINE_NOTICE_WITH(wayland, [test -z "$XKBCOMMON_LIBS"],
 WINE_NOTICE_WITH(wayland, [test -z "$XKBREGISTRY_LIBS"],
                  [libxkbregistry ${notice_platform}development files not found, the Wayland driver won't be supported.],
                  [enable_winewayland_drv])
-WINE_NOTICE_WITH(wayland, [test "$ac_cv_header_linux_input_h" = "no"],
+WINE_NOTICE_WITH(wayland, [test "$ac_cv_header_linux_input_h" = "no" -a "x${host_os#haiku}" = "x$host_os"],
                  [linux/input.h not found, the Wayland driver won't be supported.],
                  [enable_winewayland_drv])
 
