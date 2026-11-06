@@ -356,9 +356,9 @@ static inline const WORD *SS_sig_ptr( const ucontext_t *context )
 #define R14_sig(context)     ((context)->uc_mcontext.r14)
 #define R15_sig(context)     ((context)->uc_mcontext.r15)
 #define CS_sig(context)      cs64_sel
-#define FS_sig(context)      NULL
-#define GS_sig(context)      NULL
-#define SS_sig(context)      NULL
+#define FS_sig(context)      0
+#define GS_sig(context)      0
+#define SS_sig(context)      ds64_sel  /* Haiku's mcontext has no segment registers */
 #define EFL_sig(context)     ((context)->uc_mcontext.rflags)
 #define RIP_sig(context)     ((context)->uc_mcontext.rip)
 #define RSP_sig(context)     ((context)->uc_mcontext.rsp)
@@ -2282,6 +2282,7 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
 
 #ifdef __HAIKU__
 /* Debug helpers for segv_handler, enabled with WINE_HAIKU_SEGV_DEBUG=1 */
+extern int32 find_thread( const char *name );
 NTSTATUS static LdrFindEntryForAddress2( const void *addr, PLDR_DATA_TABLE_ENTRY *pmod )
 {
     PLIST_ENTRY mark, entry;

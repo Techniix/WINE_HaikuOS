@@ -27,9 +27,11 @@
 #ifdef __HAIKU__
 #define cpu_info haiku_cpu_info
 #define exit_thread haiku_exit_thread
+#define spawn_thread haiku_spawn_thread
 #include <OS.h>
 #undef cpu_info
 #undef exit_thread
+#undef spawn_thread
 #endif
 
 #include <assert.h>
