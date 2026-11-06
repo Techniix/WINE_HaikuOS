@@ -1,0 +1,675 @@
+From 08ecfa1fbd90b84c72095a44abc55c1fac484d41 Mon Sep 17 00:00:00 2001
+From: Techniix <54037125+Techniix@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 22:31:47 -0500
+Subject: [PATCH] kernel/x86_64: Add LDT and custom FS support for 32 bit code
+
+Running 32 bit code in compatibility mode inside a 64 bit team (as
+Wine's WoW64 does) needs a way to set up data segments and to point FS
+at something other than the TLS block. Add two calls to the "thread"
+generic syscall subsystem:
+
+* THREAD_SET_LDT installs entries in a per-team local descriptor table.
+  Only user mode code and data descriptors are accepted. The table is
+  loaded through a per-CPU GDT slot on context switch.
+* THREAD_SET_FS_BASE sets the FS base of the calling thread.
+
+Once a team has used either, the FS selector and FS base of its threads
+are saved and restored on context switches, and passed in the signal
+context (new fs and fs_base fields in the FXSAVE software area).
+
+Signal handlers now always run in 64 bit mode with FS pointing at the
+TLS, and returning from a signal handler can resume either 64 or 32 bit
+user code.
+---
+ headers/posix/arch/x86_64/signal.h            |   9 +-
+ .../private/kernel/arch/x86/64/descriptors.h  |   1 +
+ headers/private/kernel/arch/x86/arch_thread.h |   4 +
+ .../kernel/arch/x86/arch_thread_types.h       |  20 ++
+ .../system/arch/x86/arch_thread_defs.h        |  15 ++
+ src/system/kernel/arch/x86/64/descriptors.cpp |  77 +++++-
+ src/system/kernel/arch/x86/64/thread.cpp      | 245 +++++++++++++++++-
+ src/system/kernel/arch/x86/arch_thread.cpp    |  22 +-
+ src/system/kernel/team.cpp                    |   4 +
+ 9 files changed, 390 insertions(+), 7 deletions(-)
+
+diff --git a/headers/posix/arch/x86_64/signal.h b/headers/posix/arch/x86_64/signal.h
+index 5e30cdd..253e889 100644
+--- a/headers/posix/arch/x86_64/signal.h
++++ b/headers/posix/arch/x86_64/signal.h
+@@ -49,8 +49,15 @@ struct fpu_state {
+ 	unsigned short		cs;
+ 	unsigned short		ss;
+ 	unsigned char		trap_number;
++	unsigned char		_reserved_485_487[3];
+ 
+-	unsigned char		_available_485_511[27];
++	// User FS selector and FS base at the time of the signal. Only restored
++	// for teams that changed them (see THREAD_SET_FS_BASE/THREAD_SET_LDT).
++	unsigned short		fs;
++	unsigned short		_reserved_490_495[3];
++	unsigned long		fs_base;
++
++	unsigned char		_available_504_511[8];
+ };
+ 
+ 
+diff --git a/headers/private/kernel/arch/x86/64/descriptors.h b/headers/private/kernel/arch/x86/64/descriptors.h
+index 82a44e2..3d242d2 100644
+--- a/headers/private/kernel/arch/x86/64/descriptors.h
++++ b/headers/private/kernel/arch/x86/64/descriptors.h
+@@ -93,6 +93,7 @@ set_segment_descriptor(segment_descriptor* desc, uint8 type, uint8 dpl)
+ 
+ 
+ unsigned x86_64_set_user_tls_segment_base(int cpu, addr_t base);
++void x86_64_load_ldt(int cpu, const uint64* ldt, size_t entries);
+ 
+ 
+ #endif	/* _ASSEMBLER */
+diff --git a/headers/private/kernel/arch/x86/arch_thread.h b/headers/private/kernel/arch/x86/arch_thread.h
+index 3689d0b..14afeb2 100644
+--- a/headers/private/kernel/arch/x86/arch_thread.h
++++ b/headers/private/kernel/arch/x86/arch_thread.h
+@@ -28,6 +28,10 @@ void x86_initial_return_to_userland(Thread* thread, struct iframe* iframe);
+ 
+ void x86_restart_syscall(struct iframe* frame);
+ void x86_set_tls_context(Thread* thread);
++#ifdef __x86_64__
++void x86_64_save_user_fs(Thread* thread);
++void x86_64_restore_user_fs(Thread* thread);
++#endif
+ 
+ 
+ static inline Thread*
+diff --git a/headers/private/kernel/arch/x86/arch_thread_types.h b/headers/private/kernel/arch/x86/arch_thread_types.h
+index 1294590..2b4fd55 100644
+--- a/headers/private/kernel/arch/x86/arch_thread_types.h
++++ b/headers/private/kernel/arch/x86/arch_thread_types.h
+@@ -10,6 +10,9 @@
+ 
+ 
+ #include <SupportDefs.h>
++#ifdef __x86_64__
++#	include <KernelExport.h>
++#endif
+ 
+ #ifdef __x86_64__
+ #	include <arch/x86/64/iframe.h>
+@@ -50,6 +53,11 @@ struct arch_thread {
+ 	uintptr_t		instruction_pointer;
+ 
+ 	uint64			user_gs_base;
++
++	// User FS state, only maintained for teams with custom FS handling
++	// (arch_team::custom_fs), e.g. Wine running 32 bit code.
++	uint64			user_fs_base;
++	uint16			user_fs;
+ #else
+ 	struct farcall	current_stack;
+ 	struct farcall	interrupt_stack;
+@@ -71,10 +79,22 @@ struct arch_thread {
+ 
+ 
+ struct arch_team {
++#ifdef __x86_64__
++	// Local descriptor table (X86_LDT_ENTRIES entries) or NULL. Protected by
++	// ldt_lock; the table itself is never freed while the team exists.
++	uint64*			ldt;
++	spinlock		ldt_lock;
++
++	// Set once a thread changes its FS base or installs LDT entries. From
++	// then on the FS selector and base of the team's threads are preserved
++	// across context switches and signals.
++	bool			custom_fs;
++#else
+ 	// gcc treats empty structures as zero-length in C, but as if they contain
+ 	// a char in C++. So we have to put a dummy in to be able to use the struct
+ 	// from both in a consistent way.
+ 	char			dummy;
++#endif
+ };
+ 
+ 
+diff --git a/headers/private/system/arch/x86/arch_thread_defs.h b/headers/private/system/arch/x86/arch_thread_defs.h
+index 2975b0e..54e8990 100644
+--- a/headers/private/system/arch/x86/arch_thread_defs.h
++++ b/headers/private/system/arch/x86/arch_thread_defs.h
+@@ -6,8 +6,23 @@
+ #define _X86_THREAD_DEFS_H
+ 
+ 
++#include <stdint.h>
++
++
+ #define THREAD_SYSCALLS			"thread"
+ #define THREAD_SET_GS_BASE		1
++#define THREAD_SET_FS_BASE		2
++	// buffer: uint64 base
++#define THREAD_SET_LDT			3
++	// buffer: struct x86_ldt_args
++
++#define X86_LDT_ENTRIES			8192
++
++struct x86_ldt_args {
++	uint32_t		start;			// first LDT index to set
++	uint32_t		count;			// number of descriptors
++	const uint64_t*	descriptors;	// raw 8 byte segment descriptors
++};
+ 
+ 
+ #endif	/* _X86_THREAD_DEFS_H */
+diff --git a/src/system/kernel/arch/x86/64/descriptors.cpp b/src/system/kernel/arch/x86/64/descriptors.cpp
+index 835f0d8..4fe8b90 100644
+--- a/src/system/kernel/arch/x86/64/descriptors.cpp
++++ b/src/system/kernel/arch/x86/64/descriptors.cpp
+@@ -1,4 +1,5 @@
+ /*
++ * Copyright 2026, Techniix.
+  * Copyright 2014, Paweł Dziepak, pdziepak@quarnos.org.
+  * Copyright 2012, Alex Smith, alex@alex-smith.me.uk.
+  * Distributed under the terms of the MIT License.
+@@ -33,6 +34,7 @@ struct GenerateTable<T, Function, 0, Index...> {
+ };
+ 
+ enum class DescriptorType : unsigned {
++	LDT					= 0x2,
+ 	DataWritable		= 0x2,
+ 	CodeExecuteOnly		= 0x8,
+ 	TSS					= 0x9,
+@@ -80,6 +82,20 @@ private:
+ };
+ 
+ 
++// System descriptor (16 bytes in long mode) pointing to a local descriptor
++// table.
++class LDTDescriptor : public Descriptor {
++public:
++	inline						LDTDescriptor(uintptr_t base, size_t limit);
++
++			const Descriptor&	GetLower() const	{ return *this; }
++			const Descriptor&	GetUpper() const	{ return fSecond; }
++
++private:
++			Descriptor			fSecond;
++};
++
++
+ class UserTLSDescriptor : public Descriptor {
+ public:
+ 	inline						UserTLSDescriptor(uintptr_t base, size_t limit);
+@@ -98,10 +114,15 @@ public:
+ 										const TSSDescriptor& tss);
+ 			unsigned				SetUserTLS(unsigned cpu,
+ 										addr_t base, size_t limit);
++			unsigned				SetLDT(unsigned cpu,
++										const LDTDescriptor& ldt);
+ private:
++	// Per-CPU descriptors: TSS (2 entries), user TLS, LDT (2 entries).
+ 	static constexpr	unsigned	kFirstTSS = 6;
++	static constexpr	unsigned	kPerCPUDescriptors = 5;
+ 	static constexpr	unsigned	kDescriptorCount
+-										= kFirstTSS + SMP_MAX_CPUS * 3;
++										= kFirstTSS + SMP_MAX_CPUS
++											* kPerCPUDescriptors;
+ 
+ 	alignas(uint64_t)	Descriptor	fTable[kDescriptorCount];
+ };
+@@ -217,6 +238,19 @@ TSSDescriptor::TSSDescriptor(uintptr_t base, size_t limit)
+ }
+ 
+ 
++LDTDescriptor::LDTDescriptor(uintptr_t base, size_t limit)
++	:
++	fSecond(base >> 32, 0)
++{
++	fLimit0 = static_cast<uint16_t>(limit);
++	fBase0 = base & 0xffffff;
++	fType = static_cast<unsigned>(DescriptorType::LDT);
++	fPresent = 1;
++	fLimit1 = (limit >> 16) & 0xf;
++	fBase1 = static_cast<uint8_t>(base >> 24);
++}
++
++
+ void
+ TSSDescriptor::LoadTSS(unsigned index)
+ {
+@@ -269,7 +303,7 @@ GlobalDescriptorTable::Load() const
+ unsigned
+ GlobalDescriptorTable::SetTSS(unsigned cpu, const TSSDescriptor& tss)
+ {
+-	auto index = kFirstTSS + cpu * 3;
++	auto index = kFirstTSS + cpu * kPerCPUDescriptors;
+ 	ASSERT(index + 1 < kDescriptorCount);
+ 	fTable[index] = tss.GetLower();
+ 	fTable[index + 1] = tss.GetUpper();
+@@ -280,7 +314,7 @@ GlobalDescriptorTable::SetTSS(unsigned cpu, const TSSDescriptor& tss)
+ unsigned
+ GlobalDescriptorTable::SetUserTLS(unsigned cpu, uintptr_t base, size_t limit)
+ {
+-	auto index = kFirstTSS + cpu * 3 + 2;
++	auto index = kFirstTSS + cpu * kPerCPUDescriptors + 2;
+ 	ASSERT(index < kDescriptorCount);
+ 	UserTLSDescriptor desc(base, limit);
+ 	fTable[index] = desc.GetDescriptor();
+@@ -288,6 +322,17 @@ GlobalDescriptorTable::SetUserTLS(unsigned cpu, uintptr_t base, size_t limit)
+ }
+ 
+ 
++unsigned
++GlobalDescriptorTable::SetLDT(unsigned cpu, const LDTDescriptor& ldt)
++{
++	auto index = kFirstTSS + cpu * kPerCPUDescriptors + 3;
++	ASSERT(index + 1 < kDescriptorCount);
++	fTable[index] = ldt.GetLower();
++	fTable[index + 1] = ldt.GetUpper();
++	return index;
++}
++
++
+ constexpr
+ InterruptDescriptor::InterruptDescriptor(uintptr_t isr, unsigned ist,
+ 	bool kernelOnly)
+@@ -461,3 +506,29 @@ x86_64_set_user_tls_segment_base(int cpu, addr_t base)
+ {
+ 	return sGDT.SetUserTLS(cpu, base, TLS_COMPAT_SIZE);
+ }
++
++
++static const uint64* sLoadedLDT[SMP_MAX_CPUS];
++
++
++/*!	Makes  ldt ( entries descriptors) the local descriptor table of the
++	given CPU, which must be the current one.  ldt may be NULL to remove the
++	LDT. Interrupts must be disabled.
++*/
++void
++x86_64_load_ldt(int cpu, const uint64* ldt, size_t entries)
++{
++	if (sLoadedLDT[cpu] == ldt)
++		return;
++
++	if (ldt == NULL || entries == 0) {
++		asm volatile("lldt %w0" : : "r" (0));
++		sLoadedLDT[cpu] = NULL;
++		return;
++	}
++
++	auto index = sGDT.SetLDT(cpu,
++		LDTDescriptor(uintptr_t(ldt), entries * sizeof(uint64) - 1));
++	asm volatile("lldt %w0" : : "r" (index << 3));
++	sLoadedLDT[cpu] = ldt;
++}
+diff --git a/src/system/kernel/arch/x86/64/thread.cpp b/src/system/kernel/arch/x86/64/thread.cpp
+index 8b5a5b6..f080ce1 100644
+--- a/src/system/kernel/arch/x86/64/thread.cpp
++++ b/src/system/kernel/arch/x86/64/thread.cpp
+@@ -1,4 +1,5 @@
+ /*
++ * Copyright 2026, Techniix.
+  * Copyright 2018, Jérôme Duval, jerome.duval@gmail.com.
+  * Copyright 2012, Alex Smith, alex@alex-smith.me.uk.
+  * Copyright 2002-2008, Axel Dörfler, axeld@pinc-software.de.
+@@ -18,6 +19,7 @@
+ #include <cpu.h>
+ #include <debug.h>
+ #include <generic_syscall.h>
++#include <smp.h>
+ #include <kernel.h>
+ #include <ksignal.h>
+ #include <interrupts.h>
+@@ -25,6 +27,7 @@
+ #include <thread.h>
+ #include <tls.h>
+ #include <tracing.h>
++#include <util/AutoLock.h>
+ #include <util/Random.h>
+ #include <vm/vm_types.h>
+ #include <vm/VMAddressSpace.h>
+@@ -102,6 +105,183 @@ x86_set_tls_context(Thread* thread)
+ }
+ 
+ 
++//	#pragma mark - custom FS and LDT support
++//
++// Programs that run 32 bit code (compatibility mode) inside a 64 bit team,
++// such as Wine's WoW64, need a 32 bit code segment (USER32_CODE_SELECTOR in
++// the GDT), local descriptor table entries for their own data segments, and
++// an FS register that is not tied to the TLS block. Once a team asks for any
++// of this (THREAD_SET_FS_BASE/THREAD_SET_LDT), its threads' FS selector and
++// FS base are saved and restored on context switches and signals.
++
++
++static_assert(offsetof(struct fpu_state, fs_base) == 496,
++	"fs_base must live in the software area of the FXSAVE layout");
++
++
++static bool
++is_valid_ldt_descriptor(uint64 descriptor)
++{
++	if (descriptor == 0)
++		return true;
++
++	// Only code and data segments (no gates or other system descriptors),
++	// only for user mode, and no 64 bit code segments.
++	if ((descriptor & (1ULL << 44)) == 0)
++		return false;
++	if (((descriptor >> 45) & 3) != 3)
++		return false;
++	if ((descriptor & (1ULL << 53)) != 0)
++		return false;
++	return true;
++}
++
++
++/*!	Returns whether  selector may be loaded into FS for a thread of
++	 team. The caller must hold the team's ldt_lock.
++*/
++static bool
++is_valid_user_fs_selector(Team* team, uint16 selector)
++{
++	if (selector == 0)
++		return true;
++	if ((selector & 3) != 3)
++		return false;
++	if ((selector & 4) == 0)
++		return selector == USER_DATA_SELECTOR;
++
++	uint64* ldt = team->arch_info.ldt;
++	uint32 index = selector >> 3;
++	if (ldt == NULL || index >= X86_LDT_ENTRIES)
++		return false;
++
++	uint64 descriptor = ldt[index];
++	uint32 type = (descriptor >> 40) & 0xf;
++	return (descriptor & (1ULL << 47)) != 0			// present
++		&& (descriptor & (1ULL << 44)) != 0			// code/data
++		&& ((descriptor >> 45) & 3) == 3			// DPL 3
++		&& ((type & 0x8) == 0 || (type & 0x2) != 0);	// data or readable
++}
++
++
++/*!	Saves the FS selector and base of  thread, which must be the thread
++	currently running on this CPU (or just being switched out).
++*/
++void
++x86_64_save_user_fs(Thread* thread)
++{
++	uint16 selector;
++	asm volatile("movw %%fs, %w0" : "=r" (selector));
++	thread->arch_info.user_fs = selector;
++	thread->arch_info.user_fs_base = x86_read_msr(IA32_MSR_FS_BASE);
++}
++
++
++/*!	Loads the FS state of  thread into the current CPU. Must be called
++	with interrupts disabled, after x86_set_tls_context().
++*/
++void
++x86_64_restore_user_fs(Thread* thread)
++{
++	Team* team = thread->team;
++	int cpu = smp_get_current_cpu();
++
++	if (!team->arch_info.custom_fs) {
++		// Make sure no selector or LDT of another team lingers around.
++		uint16 selector;
++		asm volatile("movw %%fs, %w0" : "=r" (selector));
++		x86_64_load_ldt(cpu, NULL, 0);
++		if (selector != 0) {
++			asm volatile("movw %w0, %%fs" : : "r" (0));
++			x86_write_msr(IA32_MSR_FS_BASE, thread->user_local_storage);
++		}
++		return;
++	}
++
++	uint16 selector = thread->arch_info.user_fs;
++
++	acquire_spinlock(&team->arch_info.ldt_lock);
++	x86_64_load_ldt(cpu, team->arch_info.ldt, X86_LDT_ENTRIES);
++	if (!is_valid_user_fs_selector(team, selector))
++		selector = 0;
++	// Loading the selector also loads the base from the descriptor, so the
++	// base has to be written afterwards.
++	asm volatile("movw %w0, %%fs" : : "r" (selector));
++	release_spinlock(&team->arch_info.ldt_lock);
++
++	x86_write_msr(IA32_MSR_FS_BASE, thread->arch_info.user_fs_base);
++}
++
++
++static status_t
++set_user_fs_base(Thread* thread, uint64 base)
++{
++	if (!IS_USER_ADDRESS(base))
++		return B_BAD_VALUE;
++
++	thread->team->arch_info.custom_fs = true;
++
++	InterruptsLocker locker;
++	thread->arch_info.user_fs_base = base;
++	x86_write_msr(IA32_MSR_FS_BASE, base);
++	return B_OK;
++}
++
++
++static status_t
++set_ldt_entries(Thread* thread, const x86_ldt_args& args)
++{
++	if (args.start >= X86_LDT_ENTRIES
++		|| args.count > X86_LDT_ENTRIES - args.start)
++		return B_BAD_VALUE;
++	if (args.count == 0)
++		return B_OK;
++	if (!IS_USER_ADDRESS(args.descriptors))
++		return B_BAD_ADDRESS;
++
++	size_t size = args.count * sizeof(uint64);
++	uint64* descriptors = (uint64*)malloc(size);
++	if (descriptors == NULL)
++		return B_NO_MEMORY;
++	if (user_memcpy(descriptors, args.descriptors, size) != B_OK) {
++		free(descriptors);
++		return B_BAD_ADDRESS;
++	}
++	for (uint32 i = 0; i < args.count; i++) {
++		if (!is_valid_ldt_descriptor(descriptors[i])) {
++			free(descriptors);
++			return B_NOT_ALLOWED;
++		}
++	}
++
++	Team* team = thread->team;
++	uint64* newLDT = NULL;
++	if (team->arch_info.ldt == NULL) {
++		newLDT = (uint64*)malloc(X86_LDT_ENTRIES * sizeof(uint64));
++		if (newLDT == NULL) {
++			free(descriptors);
++			return B_NO_MEMORY;
++		}
++		memset(newLDT, 0, X86_LDT_ENTRIES * sizeof(uint64));
++	}
++
++	InterruptsSpinLocker locker(team->arch_info.ldt_lock);
++	if (team->arch_info.ldt == NULL) {
++		team->arch_info.ldt = newLDT;
++		newLDT = NULL;
++	}
++	memcpy(team->arch_info.ldt + args.start, descriptors, size);
++	team->arch_info.custom_fs = true;
++	x86_64_load_ldt(smp_get_current_cpu(), team->arch_info.ldt,
++		X86_LDT_ENTRIES);
++	locker.Unlock();
++
++	free(newLDT);
++	free(descriptors);
++	return B_OK;
++}
++
++
+ static addr_t
+ arch_randomize_stack_pointer(addr_t value)
+ {
+@@ -159,6 +339,34 @@ arch_thread_control(const char* subsystem, uint32 function, void* buffer,
+ 			x86_write_msr(IA32_MSR_KERNEL_GS_BASE, base);
+ 			return B_OK;
+ 		}
++
++		case THREAD_SET_FS_BASE:
++		{
++			uint64 base;
++			if (bufferSize != sizeof(base))
++				return B_BAD_VALUE;
++
++			if (!IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&base, buffer, sizeof(base)) < B_OK) {
++				return B_BAD_ADDRESS;
++			}
++
++			return set_user_fs_base(thread_get_current_thread(), base);
++		}
++
++		case THREAD_SET_LDT:
++		{
++			x86_ldt_args args;
++			if (bufferSize != sizeof(args))
++				return B_BAD_VALUE;
++
++			if (!IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&args, buffer, sizeof(args)) < B_OK) {
++				return B_BAD_ADDRESS;
++			}
++
++			return set_ldt_entries(thread_get_current_thread(), args);
++		}
+ 	}
+ 	return B_BAD_HANDLER;
+ }
+@@ -390,6 +598,13 @@ arch_setup_signal_frame(Thread* thread, struct sigaction* action,
+ 	signalFrameData->context.uc_mcontext.fpu.fp_fxsave.ss = frame->ss;
+ 	signalFrameData->context.uc_mcontext.fpu.fp_fxsave.trap_number = frame->vector;
+ 
++	uint16 fsSelector;
++	asm volatile("movw %%fs, %w0" : "=r" (fsSelector));
++	signalFrameData->context.uc_mcontext.fpu.fp_fxsave.fs = fsSelector;
++	signalFrameData->context.uc_mcontext.fpu.fp_fxsave.fs_base
++		= thread->team->arch_info.custom_fs
++			? x86_read_msr(IA32_MSR_FS_BASE) : thread->user_local_storage;
++
+ 	// Fill in signalFrameData->context.uc_stack.
+ 	signal_get_user_stack(frame->user_sp, &signalFrameData->context.uc_stack);
+ 
+@@ -427,6 +642,16 @@ arch_setup_signal_frame(Thread* thread, struct sigaction* action,
+ 	frame->di = (addr_t)userSignalFrameData;
+ 	frame->flags &= ~(uint64)(X86_EFLAGS_TRAP | X86_EFLAGS_DIRECTION);
+ 
++	// The handler wrapper is 64 bit code using the TLS, even if the thread
++	// was running 32 bit code with a different FS.
++	frame->cs = USER_CODE_SELECTOR;
++	frame->ss = USER_DATA_SELECTOR;
++	if (thread->team->arch_info.custom_fs) {
++		InterruptsLocker locker;
++		thread->arch_info.user_fs_base = thread->user_local_storage;
++		x86_write_msr(IA32_MSR_FS_BASE, thread->user_local_storage);
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -461,11 +686,27 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
+ 	// handler for information purposes only, and are not used after the signal handling is
+ 	// complete.
+ 
+-	frame->cs = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.cs;
+-	frame->ss = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.ss;
++	// Only allow returning to user mode code segments: the 64 bit one, or the
++	// 32 bit one for compatibility mode code.
++	uint16 cs = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.cs;
++	if (cs != USER_CODE_SELECTOR && cs != USER32_CODE_SELECTOR)
++		cs = USER_CODE_SELECTOR;
++	frame->cs = cs;
++	frame->ss = USER_DATA_SELECTOR;
+ 
+ 	Thread* thread = thread_get_current_thread();
+ 
++	if (thread->team->arch_info.custom_fs) {
++		uint64 fsBase = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.fs_base;
++		if (!IS_USER_ADDRESS(fsBase))
++			fsBase = thread->user_local_storage;
++
++		InterruptsLocker locker;
++		thread->arch_info.user_fs = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.fs;
++		thread->arch_info.user_fs_base = fsBase;
++		x86_64_restore_user_fs(thread);
++	}
++
+ 	memcpy(thread->arch_info.user_fpu_state,
+ 		(void*)&signalFrameData->context.uc_mcontext.fpu, min_c(gFPUSaveLength, sizeof(savefpu)));
+ 	frame->fpu = &thread->arch_info.user_fpu_state;
+diff --git a/src/system/kernel/arch/x86/arch_thread.cpp b/src/system/kernel/arch/x86/arch_thread.cpp
+index ba531e0..21d6bbf 100644
+--- a/src/system/kernel/arch/x86/arch_thread.cpp
++++ b/src/system/kernel/arch/x86/arch_thread.cpp
+@@ -179,6 +179,11 @@ x86_initial_return_to_userland(Thread* thread, iframe* frame)
+ status_t
+ arch_team_init_team_struct(Team* p, bool kernel)
+ {
++#ifdef __x86_64__
++	p->arch_info.ldt = NULL;
++	B_INITIALIZE_SPINLOCK(&p->arch_info.ldt_lock);
++	p->arch_info.custom_fs = false;
++#endif
+ 	return B_OK;
+ }
+ 
+@@ -188,6 +193,10 @@ arch_thread_init_tls(Thread *thread)
+ {
+ 	thread->user_local_storage =
+ 		thread->user_stack_base + thread->user_stack_size;
++#ifdef __x86_64__
++	thread->arch_info.user_fs = 0;
++	thread->arch_info.user_fs_base = thread->user_local_storage;
++#endif
+ 	return B_OK;
+ }
+ 
+@@ -200,10 +209,21 @@ arch_thread_context_switch(Thread* from, Thread* to)
+ 	cpuData->arch.tss.sp0 = to->kernel_stack_top;
+ 	x86_set_syscall_stack(to->kernel_stack_top);
+ 
++#ifdef __x86_64__
++	// Threads of teams with custom FS handling (Wine running 32 bit code)
++	// may have changed their FS selector and base; preserve both.
++	if (from->user_local_storage != 0 && from->team->arch_info.custom_fs)
++		x86_64_save_user_fs(from);
++#endif
++
+ 	// set TLS GDT entry to the current thread - since this action is
+ 	// dependent on the current CPU, we have to do it here
+-	if (to->user_local_storage != 0)
++	if (to->user_local_storage != 0) {
+ 		x86_set_tls_context(to);
++#ifdef __x86_64__
++		x86_64_restore_user_fs(to);
++#endif
++	}
+ 
+ 	X86PagingStructures* activePagingStructures
+ 		= cpuData->arch.active_paging_structures;
+diff --git a/src/system/kernel/team.cpp b/src/system/kernel/team.cpp
+index 91206d6..162fdb0 100644
+--- a/src/system/kernel/team.cpp
++++ b/src/system/kernel/team.cpp
+@@ -539,6 +539,10 @@ Team::~Team()
+ 	}
+ 
+ 	delete job_control_entry;
++
++#ifdef __x86_64__
++	free(arch_info.ldt);
++#endif
+ 		// usually already NULL and transferred to the parent
+ 
+ 	mutex_destroy(&fLock);
+-- 
+2.43.0
+

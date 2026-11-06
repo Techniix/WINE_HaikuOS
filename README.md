@@ -1,3 +1,7 @@
+> **This is the Haiku port of Wine.** See [README.Haiku.md](README.Haiku.md)
+> for what's different, how to build it on Haiku, credits and licensing.
+> The rest of this file is Wine's own README.
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
