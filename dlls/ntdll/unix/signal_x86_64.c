@@ -83,9 +83,25 @@ extern void _thread_set_tsd_base(uint64_t);
 #else
 #define THREAD_SYSCALLS			"thread"
 #define THREAD_SET_GS_BASE		1
+#define THREAD_SET_FS_BASE		2
+#define THREAD_SET_LDT			3
+
+struct x86_ldt_args
+{
+    uint32_t        start;
+    uint32_t        count;
+    const uint64_t *descriptors;
+};
 
 extern status_t		_kern_generic_syscall(const char *subsystem, uint32 function,
                                               void *buffer, size_t bufferSize);
+#endif
+
+/* Haiku kernels with LDT and custom FS support (needed to run 32-bit code)
+ * report the FS state in the signal context. */
+#ifdef HAVE_STRUCT_FPU_STATE_FS_BASE
+# define HAIKU_WOW64 1
+extern void __wine_haiku_set_fs_base( void *base ) __attribute__((visibility("hidden")));
 #endif
 #endif
 
@@ -355,15 +371,22 @@ static inline const WORD *SS_sig_ptr( const ucontext_t *context )
 #define R13_sig(context)     ((context)->uc_mcontext.r13)
 #define R14_sig(context)     ((context)->uc_mcontext.r14)
 #define R15_sig(context)     ((context)->uc_mcontext.r15)
+#ifdef HAIKU_WOW64
+#define CS_sig(context)      ((context)->uc_mcontext.fpu.fp_fxsave.cs)
+#define SS_sig(context)      ((context)->uc_mcontext.fpu.fp_fxsave.ss)
+#define FS_sig(context)      ((context)->uc_mcontext.fpu.fp_fxsave.fs)
+#define FSBASE_sig(context)  ((context)->uc_mcontext.fpu.fp_fxsave.fs_base)
+#else
 #define CS_sig(context)      cs64_sel
 #define FS_sig(context)      0
+#define SS_sig(context)      ds64_sel  /* older Haiku kernels don't report segment registers */
+#endif
 #define GS_sig(context)      0
-#define SS_sig(context)      ds64_sel  /* Haiku's mcontext has no segment registers */
 #define EFL_sig(context)     ((context)->uc_mcontext.rflags)
 #define RIP_sig(context)     ((context)->uc_mcontext.rip)
 #define RSP_sig(context)     ((context)->uc_mcontext.rsp)
-#define TRAP_sig(context)    TRAP_x86_PAGEFLT
-#define ERROR_sig(context)   0
+#define TRAP_sig(context)    ((context)->uc_mcontext.fpu.fp_fxsave.trap_number)
+#define ERROR_sig(context)   ((context)->uc_mcontext.fpu.fp_fxsave.error_code)
 #define FPU_sig(context)     ((XMM_SAVE_AREA32 *)&(context)->uc_mcontext.fpu)
 #define XState_sig(context)  NULL
 
@@ -758,9 +781,11 @@ static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontex
     R14_sig(sigcontext) = context->R14;
     R15_sig(sigcontext) = context->R15;
     RIP_sig(sigcontext) = context->Rip;
-#ifndef __HAIKU__
+#if !defined(__HAIKU__) || defined(HAIKU_WOW64)
     CS_sig(sigcontext)  = context->SegCs;
     FS_sig(sigcontext)  = context->SegFs;
+#endif
+#ifndef __HAIKU__
     EFL_sig(sigcontext) = context->EFlags;
 #endif
 }
@@ -831,6 +856,18 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext )))
         _thread_set_tsd_base( (uint64_t)data->teb );
+#elif defined(HAIKU_WOW64)
+    /* the kernel restores %fs and its base from the signal context */
+    if (amd64_data->pthread_teb)
+    {
+        if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+            !is_inside_syscall( data, RSP_sig(sigcontext) ))
+        {
+            FS_sig(sigcontext) = amd64_data->fs;
+            FSBASE_sig(sigcontext) = (ULONG_PTR)get_wow_teb( data->teb );
+        }
+        else FSBASE_sig(sigcontext) = (ULONG_PTR)amd64_data->pthread_teb;
+    }
 #endif
     if (is_16bit( sigcontext )) return;
 #ifdef DS_sig
@@ -1684,7 +1721,7 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "1:\tmovq %rdi,%rsp\n\t"    /* user_rsp */
                    "movq 0x98(%r14),%rbp\n\t"  /* prev_frame->rbp */
                    "ldmxcsr 0xd8(%r14)\n\t"    /* prev_frame->xsave.MxCsr */
-#if defined(__linux__) || defined(__FreeBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(HAIKU_WOW64)
                    "movb $1,0x340(%r13)\n\t"   /* amd64_thread_data()->syscall_dispatch */
                    "movw 0x338(%r13),%ax\n"    /* amd64_thread_data()->fs */
                    "testw %ax,%ax\n\t"
@@ -2748,6 +2785,22 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 #endif
 
 
+#ifdef HAIKU_WOW64
+const char __wine_haiku_thread_syscalls[] __attribute__((visibility("hidden"))) = THREAD_SYSCALLS;
+/* Called from the syscall dispatchers; must not touch TLS, as %fs may still
+ * point to the 32-bit TEB. Expects a 16-byte aligned stack. */
+__ASM_GLOBAL_FUNC( __wine_haiku_set_fs_base,
+                   "pushq %rdi\n\t"               /* buffer: base */
+                   "movq %rsp,%rdx\n\t"
+                   "leaq __wine_haiku_thread_syscalls(%rip),%rdi\n\t"
+                   "movl $2,%esi\n\t"             /* THREAD_SET_FS_BASE */
+                   "movl $8,%ecx\n\t"
+                   "call _kern_generic_syscall@PLT\n\t"
+                   "popq %rdi\n\t"
+                   "ret" )
+#endif
+
+
 /***********************************************************************
  *           ldt_set_entry
  */
@@ -2776,6 +2829,15 @@ void ldt_set_entry( WORD sel, LDT_ENTRY entry )
     if (sysarch(I386_SET_LDT, &p) == -1)
     {
         perror("i386_set_ldt");
+        exit(1);
+    }
+#elif defined(HAIKU_WOW64)
+    struct x86_ldt_args args = { .start = sel >> 3, .count = 1, .descriptors = (const uint64_t *)&entry };
+    status_t ret = _kern_generic_syscall( THREAD_SYSCALLS, THREAD_SET_LDT, &args, sizeof(args) );
+    if (ret)
+    {
+        fprintf( stderr, "wine: setting LDT entries failed (%s); running 32-bit code needs "
+                 "a Haiku kernel with LDT support\n", strerror( ret ));
         exit(1);
     }
 #else
@@ -2922,6 +2984,8 @@ void signal_init_process( TEB *teb )
         cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
 #elif defined(__FreeBSD__)
         cs32_sel = GSEL(GUCODE32_SEL, SEL_UPL);
+#elif defined(HAIKU_WOW64)
+        cs32_sel = 0x1b;  /* USER32_CODE_SELECTOR */
 #endif
     }
 
@@ -3011,8 +3075,11 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 #elif defined (__APPLE__)
     thread_data->pthread_teb = mac_thread_gsbase();
 #elif defined (__HAIKU__)
-    //thread_data->pthread_teb = amd64_thread_data()->pthread_teb;
     _kern_generic_syscall(THREAD_SYSCALLS, THREAD_SET_GS_BASE, &teb, sizeof(teb));
+#ifdef HAIKU_WOW64
+    /* the first TLS slot holds the TLS base, which %fs must point to in unix code */
+    if (get_wow_teb( teb )) __asm__ volatile( "movq %%fs:0,%0" : "=r" (thread_data->pthread_teb) );
+#endif
 #else
 # error Please define setting %gs for your architecture
 #endif
@@ -3245,6 +3312,27 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "popq %r8\n\t"
                    "leaq -0x98(%rbp),%rcx\n"
                    "2:\n\t"
+#elif defined(HAIKU_WOW64)
+                   "movq 0x320(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rsi,%rsi\n\t"
+                   "jz 2f\n\t"
+                   "pushq %rdx\n\t"
+                   "pushq %r8\n\t"
+                   "pushq %r9\n\t"
+                   "pushq %r10\n\t"
+                   "movq %rsp,%rax\n\t"
+                   "andq $~15,%rsp\n\t"
+                   "pushq %rax\n\t"
+                   "pushq %rax\n\t"
+                   "movq %rsi,%rdi\n\t"
+                   "call " __ASM_NAME("__wine_haiku_set_fs_base") "\n\t"
+                   "movq (%rsp),%rsp\n\t"
+                   "popq %r10\n\t"
+                   "popq %r9\n\t"
+                   "popq %r8\n\t"
+                   "popq %rdx\n\t"
+                   "leaq -0x98(%rbp),%rcx\n"
+                   "2:\n\t"
 #elif defined __APPLE__
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
                    "xorl %esi,%esi\n\t"
@@ -3291,7 +3379,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI(".cfi_remember_state\n\t")
                    __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
                    "leaq 0x70(%rcx),%rsp\n\t"      /* %rsp > frame means no longer inside syscall */
-#if defined(__linux__) || defined(__FreeBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(HAIKU_WOW64)
                    "movb $1,0x340(%r13)\n\t"       /* amd64_thread_data()->syscall_dispatch */
                    "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
                    "testw %dx,%dx\n\t"
@@ -3561,6 +3649,26 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "popq %r9\n\t"
                    "popq %r8\n\t"
                    "2:\n\t"
+#elif defined(HAIKU_WOW64)
+                   "movq 0x320(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rsi,%rsi\n\t"
+                   "jz 2f\n\t"
+                   "pushq %rdx\n\t"
+                   "pushq %r8\n\t"
+                   "pushq %r9\n\t"
+                   "pushq %r10\n\t"
+                   "movq %rsp,%rax\n\t"
+                   "andq $~15,%rsp\n\t"
+                   "pushq %rax\n\t"
+                   "pushq %rax\n\t"
+                   "movq %rsi,%rdi\n\t"
+                   "call " __ASM_NAME("__wine_haiku_set_fs_base") "\n\t"
+                   "movq (%rsp),%rsp\n\t"
+                   "popq %r10\n\t"
+                   "popq %r9\n\t"
+                   "popq %r8\n\t"
+                   "popq %rdx\n\t"
+                   "2:\n\t"
 #elif defined __APPLE__
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
                    "xorl %esi,%esi\n\t"
@@ -3587,7 +3695,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    /* switch to user stack */
                    "movq 0x88(%rcx),%rsp\n\t"
                    __ASM_CFI(".cfi_restore_state\n\t")
-#if defined(__linux__) || defined(__FreeBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(HAIKU_WOW64)
                    "movb $1,0x340(%r13)\n\t"       /* amd64_thread_data()->syscall_dispatch */
                    "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
                    "testw %dx,%dx\n\t"

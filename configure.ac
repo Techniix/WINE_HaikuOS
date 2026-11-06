@@ -2178,6 +2178,12 @@ AC_CACHE_CHECK([whether we can use re-entrant gethostbyname_r Linux style],
                 [Define if Linux-style gethostbyname_r and gethostbyaddr_r are available])
    fi
 
+dnl Check for Haiku kernels that report the FS state in the signal context
+dnl (needed for running 32-bit code)
+case $host_os in
+  haiku*) AC_CHECK_MEMBERS([struct fpu_state.fs_base],,,[#include <signal.h>]) ;;
+esac
+
 dnl Check for socket structure members
 AC_CHECK_MEMBERS([struct sockaddr_un.sun_len],,,
 [#include <sys/types.h>
