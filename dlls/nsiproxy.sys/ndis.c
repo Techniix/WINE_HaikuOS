@@ -63,6 +63,14 @@
 #include <net/if_types.h>
 #endif
 
+#ifdef HAVE_SYS_SOCKIO_H
+#include <sys/sockio.h>
+#endif
+
+#ifdef __HAIKU__
+#include <net/if_media.h>
+#endif
+
 #ifdef HAVE_LINUX_WIRELESS_H
 #include <linux/wireless.h>
 #endif
@@ -107,17 +115,12 @@ static pthread_mutex_t if_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct if_entry *find_entry_from_index( UINT index )
 {
-#ifdef __HAIKU__
-    return NULL;
-#else
-
     struct if_entry *entry;
 
     LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
         if (entry->if_index == index) return entry;
 
     return NULL;
-#endif
 }
 
 static struct if_entry *find_entry_from_luid( const NET_LUID *luid )
@@ -130,7 +133,63 @@ static struct if_entry *find_entry_from_luid( const NET_LUID *luid )
     return NULL;
 }
 
-#if defined (SIOCGIFHWADDR) && defined (HAVE_STRUCT_IFREQ_IFR_HWADDR)
+#if defined(__HAIKU__)
+
+static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRESS *phys_addr )
+{
+    /* the kernel copies a whole sockaddr_dl (device name + link address) into
+     * ifr_addr, which can be larger than struct ifreq */
+    union
+    {
+        struct ifreq req;
+        char buf[sizeof(struct ifreq) + sizeof(struct sockaddr_storage)];
+    } u;
+    struct sockaddr_dl *sdl = (struct sockaddr_dl *)&u.req.ifr_addr;
+    int fd, size = strlen( name ) + 1;
+    unsigned int i;
+    static const struct type_lookup
+    {
+        u_char sdl_type;
+        IFTYPE mib_type;
+    } types[] =
+    {
+        { IFT_ETHER, MIB_IF_TYPE_ETHERNET },
+        { IFT_PPP, MIB_IF_TYPE_PPP },
+        { IFT_LOOP, MIB_IF_TYPE_LOOPBACK },
+        { IFT_TUNNEL, IF_TYPE_TUNNEL },
+    };
+
+    *type = MIB_IF_TYPE_OTHER;
+    memset( phys_addr, 0, sizeof(*phys_addr) );
+
+    if (size > sizeof(u.req.ifr_name)) return STATUS_NAME_TOO_LONG;
+    memset( &u, 0, sizeof(u) );
+    memcpy( u.req.ifr_name, name, size );
+
+    fd = socket( AF_LINK, SOCK_DGRAM, 0 );
+    if (fd == -1) return STATUS_TOO_MANY_OPENED_FILES;
+
+    if (ioctl( fd, SIOCGIFADDR, &u, sizeof(u) ) || sdl->sdl_family != AF_LINK)
+    {
+        close( fd );
+        return STATUS_SUCCESS;
+    }
+    close( fd );
+
+    for (i = 0; i < ARRAY_SIZE(types); i++)
+        if (sdl->sdl_type == types[i].sdl_type)
+        {
+            *type = types[i].mib_type;
+            break;
+        }
+
+    phys_addr->Length = sdl->sdl_alen;
+    if (phys_addr->Length > sizeof(phys_addr->Address)) phys_addr->Length = 0;
+    memcpy( phys_addr->Address, LLADDR(sdl), phys_addr->Length );
+    return STATUS_SUCCESS;
+}
+
+#elif defined (SIOCGIFHWADDR) && defined (HAVE_STRUCT_IFREQ_IFR_HWADDR)
 static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRESS *phys_addr )
 {
     int fd, size, i;
@@ -298,9 +357,7 @@ static struct if_entry *add_entry( UINT index, char *name )
         return NULL;
     }
 
-#ifndef __HAIKU__
     if_get_physical( name, &entry->if_type, &entry->if_phys_addr );
-#endif
 
     entry->if_luid.Info.Reserved = 0;
     entry->if_luid.Info.NetLuidIndex = index;
@@ -356,7 +413,6 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
     fd = socket( PF_INET, SOCK_DGRAM, 0 );
     if (fd == -1) return;
 
-#ifndef __HAIKU__
     if (!ioctl( fd, SIOCGIFFLAGS, &req ))
     {
         if (req.ifr_flags & IFF_UP) data->oper_status = IfOperStatusUp;
@@ -365,7 +421,6 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
 #endif
         else data->oper_status = IfOperStatusDown;
     } else data->oper_status = IfOperStatusUnknown;
-#endif
 
     data->flags.unk = 0;
     data->flags.not_media_conn = 0;
@@ -384,16 +439,36 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
             fclose( fp );
         }
     }
+#elif defined(__HAIKU__)
+    if (!ioctl( fd, SIOCGIFMEDIA, &req ))
+        data->media_conn_state = (req.ifr_media & IFM_ACTIVE) ? MediaConnectStateConnected
+                                                                : MediaConnectStateDisconnected;
+    else
+        data->media_conn_state = MediaConnectStateUnknown;
 #else
     data->media_conn_state = MediaConnectStateConnected;
 #endif
     data->unk = 0;
 
-#ifndef __HAIKU__
     if (!ioctl( fd, SIOCGIFMTU, &req )) data->mtu = req.ifr_mtu;
     else data->mtu = 0;
-#else
-    data->mtu = 0;
+
+#ifdef __HAIKU__
+    if (!ioctl( fd, SIOCGIFSTATS, &req ))
+    {
+        data->in_octets      = req.ifr_stats.receive.bytes;
+        data->in_ucast_pkts  = req.ifr_stats.receive.packets - req.ifr_stats.receive.multicast_packets;
+        data->in_mcast_pkts  = req.ifr_stats.receive.multicast_packets;
+        data->in_errors      = req.ifr_stats.receive.errors;
+        data->in_discards    = req.ifr_stats.receive.dropped;
+        data->out_octets     = req.ifr_stats.send.bytes;
+        data->out_ucast_pkts = req.ifr_stats.send.packets - req.ifr_stats.send.multicast_packets;
+        data->out_mcast_pkts = req.ifr_stats.send.multicast_packets;
+        data->out_errors     = req.ifr_stats.send.errors;
+        data->out_discards   = req.ifr_stats.send.dropped;
+        /* Some applications check for link speed >= 1000000 */
+        data->rcv_speed = data->xmit_speed = 1000000;
+    }
 #endif
 
     close( fd );
