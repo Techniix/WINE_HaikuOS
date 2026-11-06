@@ -810,12 +810,11 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
     }
     hdr.msg_iov = async->iov;
     hdr.msg_iovlen = async->count;
-#if 0
+#ifndef __HAIKU__  /* Haiku's recvmsg() fails on sockets when ancillary data is requested */
     hdr.msg_control = control_buffer;
     hdr.msg_controllen = sizeof(control_buffer);
 #endif
 
-	TRACE("async->unix_flags: %#x\n", async->unix_flags);
     while ((ret = virtual_locked_recvmsg( fd, &hdr, async->unix_flags )) < 0 && errno == EINTR);
 
     if (ret < 0)

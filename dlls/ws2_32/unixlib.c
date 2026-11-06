@@ -87,7 +87,9 @@
 # include <linux/irda.h>
 # define HAS_IRDA
 #endif
+#ifdef __HAIKU__
 #define HAVE_GETADDRINFO
+#endif
 
 #include "ntstatus.h"
 #include "windef.h"

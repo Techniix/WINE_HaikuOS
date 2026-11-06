@@ -2280,6 +2280,8 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
     return TRUE;
 }
 
+#ifdef __HAIKU__
+/* Debug helpers for segv_handler, enabled with WINE_HAIKU_SEGV_DEBUG=1 */
 NTSTATUS static LdrFindEntryForAddress2( const void *addr, PLDR_DATA_TABLE_ENTRY *pmod )
 {
     PLIST_ENTRY mark, entry;
@@ -2320,6 +2322,18 @@ static void WriteModuleName(addr_t address)
 	printf("  BaseDllName: %s\n", debugstr_w(pmod->BaseDllName.Buffer)); printf("\n");
 }
 
+static int haiku_segv_debug(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char *env = getenv( "WINE_HAIKU_SEGV_DEBUG" );
+        enabled = env && atoi( env );
+    }
+    return enabled;
+}
+#endif /* __HAIKU__ */
+
 /**********************************************************************
  *		segv_handler
  *
@@ -2333,6 +2347,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
 #ifdef __HAIKU__
+    if (haiku_segv_debug())
+    {
 	printf("segv_handler\n");
     printf("&segv_handler: %p\n", &segv_handler);
     printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
@@ -2342,8 +2358,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
     printf("  address: %#" PRIx64 "\n", siginfo->si_addr);
     WriteModuleName(RIP_sig(sigcontext));
-    fgetc(stdin);
-    //_exit(1);
+    if (haiku_segv_debug() > 1) fgetc(stdin);  /* =2: pause so a debugger can attach */
+    }
 #endif
 
     save_context( data, &context, sigcontext );
