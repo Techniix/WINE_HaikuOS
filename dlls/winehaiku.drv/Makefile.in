@@ -1,0 +1,14 @@
+MODULE    = winehaiku.drv
+UNIXLIB   = winehaiku.so
+UNIX_LIBS = -lwin32u -lbe -lgame -lstdc++ $(PTHREAD_LIBS)
+IMPORTS   = user32 win32u
+
+VER_FILEDESCRIPTION_STR = "Wine Haiku driver"
+
+SOURCES = \
+	display.c \
+	dllmain.c \
+	haiku_be.cpp \
+	haikudrv_main.c \
+	keyboard.c \
+	window.c

@@ -1,0 +1,111 @@
+/*
+ * Haiku driver keyboard support
+ *
+ * Copyright 2026 Techniix
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#include "config.h"
+
+#include "haikudrv.h"
+
+/* Haiku key codes (which follow the physical position of the key) to PC
+ * scancodes (set 1). 0x1xx are extended (E0) keys, 0x2xx are E1 keys, as in
+ * the KBDTABLES definitions. The keyboard layout itself is win32u's default. */
+static const WORD haiku_scan_table[0x80] =
+{
+    [0x01] = 0x0001, /* Escape */
+    [0x02] = 0x003b, [0x03] = 0x003c, [0x04] = 0x003d, [0x05] = 0x003e, /* F1 - F4 */
+    [0x06] = 0x003f, [0x07] = 0x0040, [0x08] = 0x0041, [0x09] = 0x0042, /* F5 - F8 */
+    [0x0a] = 0x0043, [0x0b] = 0x0044, [0x0c] = 0x0057, [0x0d] = 0x0058, /* F9 - F12 */
+    [0x0e] = 0x0137, /* Print Screen */
+    [0x0f] = 0x0046, /* Scroll Lock */
+    [0x10] = 0x021d, /* Pause */
+
+    [0x11] = 0x0029, /* ` */
+    [0x12] = 0x0002, [0x13] = 0x0003, [0x14] = 0x0004, [0x15] = 0x0005, /* 1 - 4 */
+    [0x16] = 0x0006, [0x17] = 0x0007, [0x18] = 0x0008, [0x19] = 0x0009, /* 5 - 8 */
+    [0x1a] = 0x000a, [0x1b] = 0x000b, /* 9, 0 */
+    [0x1c] = 0x000c, /* - */
+    [0x1d] = 0x000d, /* = */
+    [0x1e] = 0x000e, /* Backspace */
+    [0x1f] = 0x0152, /* Insert */
+    [0x20] = 0x0147, /* Home */
+    [0x21] = 0x0149, /* Page Up */
+    [0x22] = 0x0045, /* Num Lock */
+    [0x23] = 0x0135, /* Keypad / */
+    [0x24] = 0x0037, /* Keypad * */
+    [0x25] = 0x004a, /* Keypad - */
+
+    [0x26] = 0x000f, /* Tab */
+    [0x27] = 0x0010, [0x28] = 0x0011, [0x29] = 0x0012, [0x2a] = 0x0013, [0x2b] = 0x0014, /* Q W E R T */
+    [0x2c] = 0x0015, [0x2d] = 0x0016, [0x2e] = 0x0017, [0x2f] = 0x0018, [0x30] = 0x0019, /* Y U I O P */
+    [0x31] = 0x001a, /* [ */
+    [0x32] = 0x001b, /* ] */
+    [0x33] = 0x002b, /* \ */
+    [0x34] = 0x0153, /* Delete */
+    [0x35] = 0x014f, /* End */
+    [0x36] = 0x0151, /* Page Down */
+    [0x37] = 0x0047, [0x38] = 0x0048, [0x39] = 0x0049, /* Keypad 7 8 9 */
+    [0x3a] = 0x004e, /* Keypad + */
+
+    [0x3b] = 0x003a, /* Caps Lock */
+    [0x3c] = 0x001e, [0x3d] = 0x001f, [0x3e] = 0x0020, [0x3f] = 0x0021, [0x40] = 0x0022, /* A S D F G */
+    [0x41] = 0x0023, [0x42] = 0x0024, [0x43] = 0x0025, [0x44] = 0x0026, /* H J K L */
+    [0x45] = 0x0027, /* ; */
+    [0x46] = 0x0028, /* ' */
+    [0x47] = 0x001c, /* Enter */
+    [0x48] = 0x004b, [0x49] = 0x004c, [0x4a] = 0x004d, /* Keypad 4 5 6 */
+
+    [0x4b] = 0x002a, /* Left Shift */
+    [0x4c] = 0x002c, [0x4d] = 0x002d, [0x4e] = 0x002e, [0x4f] = 0x002f, /* Z X C V */
+    [0x50] = 0x0030, [0x51] = 0x0031, [0x52] = 0x0032, /* B N M */
+    [0x53] = 0x0033, /* , */
+    [0x54] = 0x0034, /* . */
+    [0x55] = 0x0035, /* / */
+    [0x56] = 0x0036, /* Right Shift */
+    [0x57] = 0x0148, /* Up */
+    [0x58] = 0x004f, [0x59] = 0x0050, [0x5a] = 0x0051, /* Keypad 1 2 3 */
+    [0x5b] = 0x011c, /* Keypad Enter */
+
+    [0x5c] = 0x001d, /* Left Control */
+    [0x5d] = 0x0038, /* Left Command (Alt) */
+    [0x5e] = 0x0039, /* Space */
+    [0x5f] = 0x0138, /* Right Command (AltGr) */
+    [0x60] = 0x011d, /* Right Control */
+    [0x61] = 0x014b, /* Left */
+    [0x62] = 0x0150, /* Down */
+    [0x63] = 0x014d, /* Right */
+    [0x64] = 0x0052, /* Keypad 0 */
+    [0x65] = 0x0053, /* Keypad . */
+    [0x66] = 0x015b, /* Left Option (Windows) */
+    [0x67] = 0x015c, /* Right Option (Windows) */
+    [0x68] = 0x015d, /* Menu */
+    [0x69] = 0x0056, /* ISO extra key (< >) */
+
+    [0x7e] = 0x0054, /* SysRq */
+    [0x7f] = 0x0146, /* Break */
+};
+
+UINT haiku_key_to_scan( int key )
+{
+    if (key < 0 || key >= ARRAY_SIZE(haiku_scan_table)) return 0;
+    return haiku_scan_table[key];
+}

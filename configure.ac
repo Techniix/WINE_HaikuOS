@@ -1119,6 +1119,10 @@ esac
 enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
 enable_wineandroid_drv=${enable_wineandroid_drv:-no}
 enable_winemac_drv=${enable_winemac_drv:-no}
+case $host_os in
+  haiku*) ;;
+  *) enable_winehaiku_drv=${enable_winehaiku_drv:-no} ;;
+esac
 
 dnl **** External libraries ****
 
@@ -1476,7 +1480,7 @@ WINE_NOTICE_WITH(wayland, [test "$ac_cv_header_linux_input_h" = "no" -a "x${host
                  [linux/input.h not found, the Wayland driver won't be supported.],
                  [enable_winewayland_drv])
 
-if test "$enable_wineandroid_drv$enable_winemac_drv$enable_winewayland_drv" = "nonono"
+if test "$enable_wineandroid_drv$enable_winemac_drv$enable_winewayland_drv$enable_winehaiku_drv" = "nononono"
 then
     WINE_ERROR_WITH(x,[test "x$X_LIBS" = "x"],
 [X ${notice_platform}development files not found. Wine will be built
@@ -3347,6 +3351,7 @@ WINE_CONFIG_MAKEFILE(dlls/winecoreaudio.drv)
 WINE_CONFIG_MAKEFILE(dlls/wined3d)
 WINE_CONFIG_MAKEFILE(dlls/winedmo)
 WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
+WINE_CONFIG_MAKEFILE(dlls/winehaiku.drv)
 WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
 WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
 WINE_CONFIG_MAKEFILE(dlls/winemapi)
