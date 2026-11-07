@@ -261,6 +261,14 @@ class WineApplication : public BApplication
 {
 public:
     WineApplication() : BApplication( "application/x-vnd.Wine" ) {}
+
+    void DispatchMessage( BMessage *msg, BHandler *target )
+    {
+        /* Wine rewrites the process arguments at startup, so the copy Haiku
+         * sends us doesn't parse (and we don't need it anyway). */
+        if (msg->what == B_ARGV_RECEIVED) return;
+        BApplication::DispatchMessage( msg, target );
+    }
 };
 
 static sem_id app_ready = -1;
