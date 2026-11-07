@@ -32,6 +32,18 @@
 #ifdef __APPLE__
 # include <mach-o/dyld.h>
 #endif
+#ifdef __HAIKU__
+/* keep <OS.h> from clashing with the server's own thread functions */
+# define kill_thread haiku_kill_thread
+# define set_thread_priority haiku_set_thread_priority
+# define suspend_thread haiku_suspend_thread
+# define resume_thread haiku_resume_thread
+# include <image.h>
+# undef kill_thread
+# undef set_thread_priority
+# undef suspend_thread
+# undef resume_thread
+#endif
 
 #include "windef.h"
 #include "winternl.h"
@@ -303,6 +315,17 @@ static char *get_nls_dir(void)
             free( dir );
             dir = NULL;
         }
+    }
+#elif defined(__HAIKU__)
+    image_info info;
+    int32 cookie = 0;
+
+    dir = NULL;
+    while (get_next_image_info( B_CURRENT_TEAM, &cookie, &info ) == B_OK)
+    {
+        if (info.type != B_APP_IMAGE) continue;
+        dir = realpath( info.name, NULL );
+        break;
     }
 #else
     dir = realpath( server_argv0, NULL );
